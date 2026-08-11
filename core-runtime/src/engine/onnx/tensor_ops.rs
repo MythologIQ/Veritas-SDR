@@ -10,18 +10,21 @@ use candle_core::{DType, Device, Tensor};
 
 use crate::engine::InferenceError;
 
-/// Build `input_ids`, `attention_mask`, `token_type_ids` tensors for a single
-/// unpadded sequence (`[1, seq_len]`, mask all ones).
+/// Build `input_ids`, `attention_mask`, `token_type_ids` tensors (`[1, seq]`)
+/// for a single tokenized sequence. The attention mask is the tokenizer's own
+/// — when the tokenizer pads (MiniLM's `tokenizer.json` pads to 128), padded
+/// positions carry mask 0 and must not be attended or pooled.
 pub(super) fn build_transformer_inputs(
-    tokens: &[i64],
+    encoded: &super::tokenizer::TokenizedInput,
     device: &Device,
 ) -> Result<HashMap<String, Tensor>, InferenceError> {
-    let ids = Tensor::new(tokens, device)
+    let ids = Tensor::new(encoded.ids.as_slice(), device)
         .and_then(|t| t.unsqueeze(0))
         .map_err(|e| InferenceError::ModelError(format!("input: {e}")))?;
 
-    let attn =
-        Tensor::ones_like(&ids).map_err(|e| InferenceError::ModelError(format!("attn: {e}")))?;
+    let attn = Tensor::new(encoded.attention_mask.as_slice(), device)
+        .and_then(|t| t.unsqueeze(0))
+        .map_err(|e| InferenceError::ModelError(format!("attn: {e}")))?;
 
     let ttype =
         Tensor::zeros_like(&ids).map_err(|e| InferenceError::ModelError(format!("ttype: {e}")))?;

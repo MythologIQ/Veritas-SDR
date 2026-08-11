@@ -8,6 +8,15 @@
 
 use std::path::Path;
 
+/// Token ids plus their attention mask. The mask is the tokenizer's own
+/// (real tokenizers may pad to a fixed length — e.g. the MiniLM
+/// `tokenizer.json` pads to 128 — and padded positions must not be attended
+/// or pooled), never fabricated downstream.
+pub(super) struct TokenizedInput {
+    pub(super) ids: Vec<i64>,
+    pub(super) attention_mask: Vec<i64>,
+}
+
 /// Tokenizer used by the ONNX models.
 pub(super) enum OnnxTokenizer {
     /// Real subword tokenizer from a local `tokenizer.json` (offline).
@@ -43,12 +52,20 @@ impl OnnxTokenizer {
         }
     }
 
-    /// Encode text to model input ids. A `WordPiece` encode error degrades to the
-    /// hash fallback for that call rather than panicking on the inference path.
-    pub(super) fn encode(&self, text: &str) -> Vec<i64> {
+    /// Encode text to model input ids + attention mask. A `WordPiece` encode
+    /// error degrades to the hash fallback for that call rather than panicking
+    /// on the inference path.
+    pub(super) fn encode(&self, text: &str) -> TokenizedInput {
         match self {
             Self::WordPiece(tok) => match tok.encode(text, true) {
-                Ok(enc) => enc.get_ids().iter().map(|&id| i64::from(id)).collect(),
+                Ok(enc) => TokenizedInput {
+                    ids: enc.get_ids().iter().map(|&id| i64::from(id)).collect(),
+                    attention_mask: enc
+                        .get_attention_mask()
+                        .iter()
+                        .map(|&m| i64::from(m))
+                        .collect(),
+                },
                 Err(e) => {
                     tracing::warn!(error = %e, "WordPiece encode failed; using hash fallback");
                     hash_encode(text)
@@ -61,7 +78,8 @@ impl OnnxTokenizer {
 
 /// Deterministic hash-based encoding wrapped with hard-coded BERT `[CLS]`/`[SEP]`.
 /// NOT a real vocabulary — a degraded fallback only (formerly `simple_tokenize`).
-fn hash_encode(text: &str) -> Vec<i64> {
+/// Never pads, so its attention mask is all ones.
+fn hash_encode(text: &str) -> TokenizedInput {
     let mut ids = vec![101i64]; // [CLS]
     for word in text.split_whitespace() {
         let hash = word.bytes().fold(0u64, |acc, b| {
@@ -70,7 +88,11 @@ fn hash_encode(text: &str) -> Vec<i64> {
         ids.push((hash % 29_000 + 1_000) as i64);
     }
     ids.push(102); // [SEP]
-    ids
+    let attention_mask = vec![1i64; ids.len()];
+    TokenizedInput {
+        ids,
+        attention_mask,
+    }
 }
 
 #[cfg(test)]
@@ -81,10 +103,11 @@ mod tests {
     fn hash_fallback_is_deterministic_and_wraps_cls_sep() {
         let a = OnnxTokenizer::HashFallback.encode("hello world");
         let b = OnnxTokenizer::HashFallback.encode("hello world");
-        assert_eq!(a, b, "hash fallback must be deterministic");
-        assert_eq!(a.first(), Some(&101), "leading [CLS]");
-        assert_eq!(a.last(), Some(&102), "trailing [SEP]");
-        assert_eq!(a.len(), 4, "[CLS] + 2 words + [SEP]");
+        assert_eq!(a.ids, b.ids, "hash fallback must be deterministic");
+        assert_eq!(a.ids.first(), Some(&101), "leading [CLS]");
+        assert_eq!(a.ids.last(), Some(&102), "trailing [SEP]");
+        assert_eq!(a.ids.len(), 4, "[CLS] + 2 words + [SEP]");
+        assert_eq!(a.attention_mask, vec![1; 4], "unpadded mask is all ones");
     }
 
     #[test]
@@ -131,8 +154,17 @@ mod tests {
             "sibling tokenizer.json must load as WordPiece"
         );
 
-        let ids = resolved.encode("hello world");
-        assert_eq!(ids, vec![3, 4], "must map to real vocab ids, not hashes");
+        let encoded = resolved.encode("hello world");
+        assert_eq!(
+            encoded.ids,
+            vec![3, 4],
+            "must map to real vocab ids, not hashes"
+        );
+        assert_eq!(
+            encoded.attention_mask,
+            vec![1, 1],
+            "mask covers exactly the real tokens"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

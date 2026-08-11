@@ -139,3 +139,60 @@ async fn not_loaded_embedder_errors_cleanly() {
 fn embedding_dim_is_reported() {
     assert_eq!(OnnxEmbedder::new("m".into(), 384).embedding_dim(), 384);
 }
+
+/// Real-model e2e against all-MiniLM-L6-v2 (fp32 export: 19 ops incl. Erf/
+/// MatMul/Softmax — full `simple_eval` coverage check, unlike the Gather-only
+/// tiny fixture). The ~90 MB model is gitignored; skips gracefully when absent
+/// (same convention as the classifier's fixture test). Place the model at
+/// `fixtures/models/onnx/all-MiniLM-L6-v2/{model.onnx,tokenizer.json}`.
+#[cfg(feature = "onnx")]
+#[tokio::test]
+async fn load_and_embed_real_minilm() {
+    let model_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/models/onnx");
+    if !model_dir.join("all-MiniLM-L6-v2/model.onnx").exists() {
+        eprintln!("skipping load_and_embed_real_minilm: gitignored model not present");
+        return;
+    }
+    let embedder = OnnxEmbedder::load(&model_dir, "all-MiniLM-L6-v2", 384)
+        .expect("real MiniLM model must load");
+    assert!(
+        embedder.memory_usage() > 80_000_000,
+        "~90 MB of weights reported, got {}",
+        embedder.memory_usage()
+    );
+
+    let cat = embed_one(&embedder, "the cat sits on the mat").await;
+    assert_eq!(cat.len(), 384, "MiniLM embeds at 384 dims");
+    let norm = cat.iter().map(|v| v * v).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-5, "L2 norm = {norm}");
+    assert_eq!(
+        cat,
+        embed_one(&embedder, "the cat sits on the mat").await,
+        "deterministic"
+    );
+
+    // Golden cross-check: first dims of the reference embedding computed with
+    // onnxruntime + the `tokenizers` library over the same files (padded-to-128
+    // ids, mask-weighted mean pool, L2 normalize). Catches tokenizer/mask/
+    // pooling drift, not just op coverage.
+    const REFERENCE_CAT_PREFIX: [f32; 8] = [
+        0.134891, -0.032063, -0.020335, 0.035901, -0.028333, 0.041502, 0.033159, 0.036606,
+    ];
+    for (i, (got, want)) in cat.iter().zip(REFERENCE_CAT_PREFIX.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-3,
+            "dim {i}: got {got}, onnxruntime reference {want}"
+        );
+    }
+
+    // Semantic sanity: unit vectors, so cosine similarity == dot product.
+    // onnxruntime reference: cat/kitten 0.6470, cat/quark -0.0415.
+    let kitten = embed_one(&embedder, "a kitten rests on a rug").await;
+    let quark = embed_one(&embedder, "quantum chromodynamics of gluons").await;
+    let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+    let (near, far) = (dot(&cat, &kitten), dot(&cat, &quark));
+    eprintln!("minilm cosine: cat/kitten = {near:.4}, cat/quark = {far:.4}");
+    assert!((near - 0.6470).abs() < 0.02, "cat/kitten cosine = {near}");
+    assert!((far - -0.0415).abs() < 0.02, "cat/quark cosine = {far}");
+}

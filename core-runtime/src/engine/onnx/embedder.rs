@@ -122,15 +122,15 @@ impl OnnxEmbedder {
             InferenceError::ModelError(format!("model '{}' not loaded", self.model_id))
         })?;
 
-        let tokens = self.tokenizer.encode(text);
-        if tokens.is_empty() {
+        let encoded = self.tokenizer.encode(text);
+        if !encoded.attention_mask.contains(&1) {
             return Err(InferenceError::InputValidation(
-                "input tokenized to zero tokens".into(),
+                "input tokenized to zero attended tokens".into(),
             ));
         }
 
         let device = candle_core::Device::Cpu;
-        let inputs = tensor_ops::build_transformer_inputs(&tokens, &device)?;
+        let inputs = tensor_ops::build_transformer_inputs(&encoded, &device)?;
         let attention_mask = inputs["attention_mask"].clone();
 
         let outputs = candle_onnx::simple_eval(model, inputs)

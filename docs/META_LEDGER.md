@@ -11312,3 +11312,49 @@ per Entry #202/#203 convention.
 **Decision**: B-ONNX-1 COMPLETE and sealed — the ONNX embedder performs real, deterministic,
 normalized inference loadable from model files, with committed-fixture golden coverage. Chain tip:
 `6ced56ec56989942b43ad3fbcbd1f9c6000408049621e26c9b31160db67bd4b3`.
+
+---
+
+### Entry #205: VERIFY ADDENDUM — real-model validation + attention-mask fix (B-ONNX-1)
+
+**Entry ID**: `a7537133f4c9`
+**Timestamp**: 2026-08-11T16:30:00-04:00
+**Phase**: VERIFY (post-seal addendum to Entry #204; same session scope, same branch)
+**Author**: Specialist + Judge
+**Risk Grade**: L2
+
+**Target**: blueprint B2 (correct pooling pipeline) validated against the real
+all-MiniLM-L6-v2 fp32 ONNX export (gitignored `fixtures/models/onnx/all-MiniLM-L6-v2/`,
+sourced from the qdrant-fastembed GCS mirror — huggingface.co is policy-blocked in this
+environment; model + tokenizer are byte-served, nothing added to git).
+
+**Finding (defect caught)**: the pipeline's cosine similarities were compressed and
+uniformly inflated (unrelated text ~0.75 vs reference -0.04). Root cause: MiniLM's
+`tokenizer.json` pads to 128, but `OnnxTokenizer::encode` returned ids only and
+`build_transformer_inputs` fabricated an all-ones attention mask — the model attended
+~120 [PAD] tokens and the masked mean pooled them in. The tiny Gather-only fixture could
+not catch this (its tokenizer never pads); this is precisely the risk the real-model
+validation step existed to retire.
+
+**Fix**: `TokenizedInput { ids, attention_mask }` — the tokenizer's own mask now flows
+through `build_transformer_inputs` verbatim (embedder AND classifier; the hash fallback
+emits all-ones explicitly, it never pads). Zero-attended-token inputs fail loud.
+
+**Verification (local)**: `load_and_embed_real_minilm` (skip-if-absent, release) now
+golden-cross-checks against an onnxruntime + `tokenizers` reference over the same files:
+first 8 dims agree within 1e-3; cosines reproduce within 0.02 (cat/kitten 0.6470,
+cat/quark -0.0415). Op coverage confirmed: `candle_onnx::simple_eval` evaluates the full
+19-op MiniLM graph (Erf/MatMul/Softmax/ReduceMean/…), single `last_hidden_state` output
+hit by the deterministic selection rule. Full gates re-run green: 588/597 lib tests,
+clippy -D warnings + fmt clean, both feature configs. Tiny-fixture goldens unchanged
+(unpadded tokenizer → identical mask).
+
+**Content Hash** (SHA256 of CHANGELOG.md): `6aa0fbf3db63ed2324dde624ab065b0548b1e94230ebef0689e66be12ec498c7`
+
+**Previous Hash**: `6ced56ec56989942b43ad3fbcbd1f9c6000408049621e26c9b31160db67bd4b3`
+
+**Chain Hash** (SHA256 of content + "|" + previous): `a7537133f4c9caa7c5d5d364dcd3c58c967111419b5b3abb3ae4accc7936b9f3`
+
+**Decision**: Real-model validation COMPLETE — the residual risk flagged in Entry #204 and
+PR #110 is retired, with one true-positive defect found and fixed. The `ort` fallback is
+NOT needed. Chain tip: `a7537133f4c9caa7c5d5d364dcd3c58c967111419b5b3abb3ae4accc7936b9f3`.

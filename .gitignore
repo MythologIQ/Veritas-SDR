@@ -18,6 +18,8 @@ PRIVATE/
 llvm*.exe
 tools/llvm16/
 *.onnx
+# ...except the tiny committed ONNX test fixture (~1 KB, B-ONNX-1)
+!core-runtime/tests/fixtures/**/*.onnx
 
 # Model files (download separately)
 core-runtime/fixtures/models/

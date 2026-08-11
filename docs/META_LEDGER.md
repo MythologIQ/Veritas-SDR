@@ -11225,3 +11225,136 @@ strict (no glossary); intent_lock NO LOCK (direct implement). `verify-ledger` �
 loose ends are closed (F2/F3 already-done + phantom §12.2 corrected + grounded security test), and
 speculative telemetry is visible in `status`. NOT pushed — operator decides merge. Chain tip:
 `c491f438fd44f371517ffb378eb318ffeffc1e999c73acdf4321425d679f3b5b`.
+
+---
+
+### Entry #203: GATE TRIBUNAL — PASS (L2) (B-ONNX-1 real ONNX embedding inference)
+
+**Entry ID**: `364f4d467d17`
+**Timestamp**: 2026-08-11T00:00:00-04:00
+**Phase**: GATE
+**Author**: Judge
+**Risk Grade**: L2 (engine logic; no ipc/sandbox/security surface)
+
+**Target**: `docs/plan-onnx-real-inference-2026-08-11.md` — replace the ONNX embedder's
+degraded path with real inference: `OnnxEmbedder::load(model_dir, model_id, dim)` reading
+`<model_dir>/<model_id>/{model.onnx,tokenizer.json}` offline; deterministic output selection
+(`last_hidden_state` | single-output | fail loud); masked mean-pool + L2-normalize;
+`TextBatch` embeds every item via additive `InferenceOutput::EmbeddingBatch`; initializer-sum
+memory accounting; committed ~1 KB handcrafted ONNX fixture (zero test-time downloads).
+Consumer: EvolveAI plan-v6.2 Phase 1 (`ggcore` feature, `vendor/GG-CORE`).
+
+**Verdict**: PASS
+
+All six passes clean. Security: fail-closed load, read-only model IO, no new network surface
+(tokenizers stays `default-features = false`). Razor: mandatory file split (embedder.rs at
+222 lines) — embedder.rs / tensor_ops.rs (new, shared helpers single-sourced for classifier
+too) / embedder_tests.rs, all ≤250. Dependencies: none new. Orphans: none — all files trace
+to `lib.rs` or the `#[cfg(test)]` include; fixture generator is dev-only tooling with
+`scripts/` precedent. Macro: confined to `engine/onnx/`; sole in-repo `InferenceOutput`
+match (`engine/inference.rs:206`) has a wildcard arm, so the additive variant breaks nothing.
+
+**Content Hash** (SHA256 of .agent/staging/AUDIT_REPORT.md): `e160be6635f814cf1ad82119081f6ad105247d1ec7c42e0542e917bb4c5c3de3`
+
+**Previous Hash**: `c491f438fd44f371517ffb378eb318ffeffc1e999c73acdf4321425d679f3b5b`
+
+**Chain Hash** (SHA256 of content + "|" + previous): `364f4d467d171b75bec5746f67b7d0aea96917a5f862a8dbc6923c5d7c55c057`
+
+**Decision**: Gate OPEN — Specialist may proceed with `/ql-implement` against the blueprint
+as written. Chain tip: `364f4d467d171b75bec5746f67b7d0aea96917a5f862a8dbc6923c5d7c55c057`.
+
+---
+
+### Entry #204: SESSION SEAL (B-ONNX-1 — real ONNX embedding inference)
+
+**Entry ID**: `6ced56ec5698`
+**Timestamp**: 2026-08-11T00:00:00-04:00
+**Phase**: SUBSTANTIATE (local seal; branch pushed as `feature/onnx-real-inference` — operator decides merge)
+**Author**: Specialist + Judge
+**Risk Grade**: L2 (engine logic; no ipc/sandbox/security surface)
+**Session ID**: 2026-08-11T-onnx-real-inference
+
+**Target**: `docs/plan-onnx-real-inference-2026-08-11.md` (audit PASS Entry #203).
+
+**Reality vs Promise**: MATCH. B1: `OnnxEmbedder::load(model_dir, model_id, embedding_dim)` reads
+`<model_dir>/<model_id>/model.onnx` via `candle_onnx::read_file` + sibling `tokenizer.json` via the
+B-28 offline `for_model` path; fail-closed on missing/invalid model; compiled under both feature
+configs (non-`onnx` fails loud); `new()` unchanged as the not-loaded state. B2: deterministic
+hidden-state selection (`last_hidden_state` | single output | fail loud) replaced the
+nondeterministic `HashMap::values().next()`; attention-masked mean pool + L2 normalize replaced
+the unmasked unnormalized mean; zero-token inputs rejected. B3: `TextBatch` embeds every item →
+additive `InferenceOutput::EmbeddingBatch`; `Text` → `Embedding` unchanged (EvolveAI-compatible).
+B4: `with_model` seeds `memory_bytes` from the initializer-payload sum; `unload()` zeroes it.
+B5: split as gated — `embedder.rs` 206 / `tensor_ops.rs` 100 / `embedder_tests.rs` 141 lines, all
+≤250, functions ≤40, nesting ≤3; classifier imports the single-sourced helpers. B6: committed
+818-byte handcrafted fixture (`tests/fixtures/models/onnx/tiny-embedder/` + gitignore negation for
+exactly that path; generator `scripts/gen_onnx_fixture.py`, never run at build/test time) backing
+golden-vector, unit-norm, determinism-across-loads, batch==per-item, fail-loud, and memory tests.
+
+**Verification (local)**: `cargo test --lib` → 588 passed; `--features onnx --lib` → 596 passed;
+all integration test targets pass under both configs (0 failures). `cargo clippy --all-targets
+-- -D warnings` CLEAN with and without `onnx`. `cargo fmt --check` CLEAN. `protoc` required to
+build `candle-onnx` (env-only note; no manifest change). Zero new dependencies; forbidden-deps
+list untouched.
+
+**Environmental SKIPs**: seal-gate ladder scripts (skill_admission, secret_scanner,
+feature_index_verify, governance-index) not present in this checkout; ledger chained manually
+per Entry #202/#203 convention.
+
+**Content Hash** (SHA256 of CHANGELOG.md): `d890ecc99a1150a515ee0101f4d538f1cfccc4effd1189b4ad91420f4e26ccfe`
+
+**Previous Hash**: `364f4d467d171b75bec5746f67b7d0aea96917a5f862a8dbc6923c5d7c55c057`
+
+**Chain Hash** (SHA256 of content + "|" + previous): `6ced56ec56989942b43ad3fbcbd1f9c6000408049621e26c9b31160db67bd4b3`
+
+**Session Seal** (SHA256 of chain + "SEALED"): `8c57ad600e004c411a0a51b6c99b2fa14b0bfa5463330bcedcf1bef4cb23ad3e`
+
+**Decision**: B-ONNX-1 COMPLETE and sealed — the ONNX embedder performs real, deterministic,
+normalized inference loadable from model files, with committed-fixture golden coverage. Chain tip:
+`6ced56ec56989942b43ad3fbcbd1f9c6000408049621e26c9b31160db67bd4b3`.
+
+---
+
+### Entry #205: VERIFY ADDENDUM — real-model validation + attention-mask fix (B-ONNX-1)
+
+**Entry ID**: `a7537133f4c9`
+**Timestamp**: 2026-08-11T16:30:00-04:00
+**Phase**: VERIFY (post-seal addendum to Entry #204; same session scope, same branch)
+**Author**: Specialist + Judge
+**Risk Grade**: L2
+
+**Target**: blueprint B2 (correct pooling pipeline) validated against the real
+all-MiniLM-L6-v2 fp32 ONNX export (gitignored `fixtures/models/onnx/all-MiniLM-L6-v2/`,
+sourced from the qdrant-fastembed GCS mirror — huggingface.co is policy-blocked in this
+environment; model + tokenizer are byte-served, nothing added to git).
+
+**Finding (defect caught)**: the pipeline's cosine similarities were compressed and
+uniformly inflated (unrelated text ~0.75 vs reference -0.04). Root cause: MiniLM's
+`tokenizer.json` pads to 128, but `OnnxTokenizer::encode` returned ids only and
+`build_transformer_inputs` fabricated an all-ones attention mask — the model attended
+~120 [PAD] tokens and the masked mean pooled them in. The tiny Gather-only fixture could
+not catch this (its tokenizer never pads); this is precisely the risk the real-model
+validation step existed to retire.
+
+**Fix**: `TokenizedInput { ids, attention_mask }` — the tokenizer's own mask now flows
+through `build_transformer_inputs` verbatim (embedder AND classifier; the hash fallback
+emits all-ones explicitly, it never pads). Zero-attended-token inputs fail loud.
+
+**Verification (local)**: `load_and_embed_real_minilm` (skip-if-absent, release) now
+golden-cross-checks against an onnxruntime + `tokenizers` reference over the same files:
+first 8 dims agree within 1e-3; cosines reproduce within 0.02 (cat/kitten 0.6470,
+cat/quark -0.0415). Op coverage confirmed: `candle_onnx::simple_eval` evaluates the full
+19-op MiniLM graph (Erf/MatMul/Softmax/ReduceMean/…), single `last_hidden_state` output
+hit by the deterministic selection rule. Full gates re-run green: 588/597 lib tests,
+clippy -D warnings + fmt clean, both feature configs. Tiny-fixture goldens unchanged
+(unpadded tokenizer → identical mask).
+
+**Content Hash** (SHA256 of CHANGELOG.md): `6aa0fbf3db63ed2324dde624ab065b0548b1e94230ebef0689e66be12ec498c7`
+
+**Previous Hash**: `6ced56ec56989942b43ad3fbcbd1f9c6000408049621e26c9b31160db67bd4b3`
+
+**Chain Hash** (SHA256 of content + "|" + previous): `a7537133f4c9caa7c5d5d364dcd3c58c967111419b5b3abb3ae4accc7936b9f3`
+
+**Decision**: Real-model validation COMPLETE — the residual risk flagged in Entry #204 and
+PR #110 is retired, with one true-positive defect found and fixed. The `ort` fallback is
+NOT needed. Chain tip: `a7537133f4c9caa7c5d5d364dcd3c58c967111419b5b3abb3ae4accc7936b9f3`.

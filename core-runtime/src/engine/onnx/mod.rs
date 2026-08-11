@@ -6,6 +6,8 @@ mod classifier;
 mod dispatch;
 mod embedder;
 #[cfg(feature = "onnx")]
+mod tensor_ops;
+#[cfg(feature = "onnx")]
 mod tokenizer;
 
 pub use classifier::OnnxClassifier;

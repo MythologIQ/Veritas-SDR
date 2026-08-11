@@ -1,54 +1,101 @@
-# AUDIT REPORT — B-24b: Streaming Egress PII Sanitization
+# AUDIT REPORT
 
-**Session ID**: 2026-07-27T-b24b
-**Auditor**: Judge (independent pass)
-**Target**: docs/plan-b24b-streaming-egress-2026-07-27.md
-**Risk Grade**: L3 (egress security path)
-**Verdict**: **PASS**
+**Tribunal Date**: 2026-08-11T00:00:00-04:00
+**Target**: `docs/plan-onnx-real-inference-2026-08-11.md` (B-ONNX-1 — real ONNX embedding inference)
+**Risk Grade**: L2
+**Auditor**: The QoreLogic Judge
 
 ---
 
-## Checks
+## VERDICT: PASS
 
-### 1. Threat closure — the plan actually closes F1 — PASS
-Sanitizing inside `run_stream_sync` and emitting sanitized `Text` only means raw
-token ids never leave the runtime on the secured path; a client cannot reconstruct
-unsanitized output. This is the correct enforcement point (the producer owns the
-detokenizer).
+---
 
-### 2. Holdback correctness argument — PASS (with test mandate)
-The release rule (cut = len − H, backed off a char boundary not inside an
-alphanumeric run, whole-buffer re-sanitize) makes any PII fully within `[0, cut)`
-final, because the cut trails the growing end by ≥ H and never bisects a numeric run.
-The residual risk (PII longer than H split at the cut) is explicitly documented.
-**Mandate**: IMPLEMENT must include adversarial tests that split a multi-word address
-and a month-name DOB across `push` calls and across the H boundary, and assert
-redaction — not just a happy-path test.
+### Executive Summary
 
-### 3. Signature ripple — PASS (flagged)
-`run_stream_sync` gains `&SecurityPipeline`; the ripple reaches `infer_stream`
-(facade), `worker_streaming::run_stream`, and any test caller. IMPLEMENT must update
-all call sites; the "no worker/no pipeline" case (Python binding path) must pass
-`None`/skip sanitization coherently (it already routes through `infer`, not
-`infer_stream`, so likely unaffected — verify).
+The blueprint replaces the ONNX embedder's degraded inference path (unmasked mean pool, no
+normalization, nondeterministic output pick, first-item-only batches, zero memory accounting)
+with a correct, deterministic pipeline plus a `load()` entry point, using only dependencies
+already declared behind the `onnx` feature. No security surface (`ipc/`, `sandbox/`,
+`security/`) is touched; model IO is read-only from a caller-supplied directory; the committed
+~1 KB fixture eliminates any test-time download. File-split plan keeps every file under the
+250-line Razor ceiling. No violation found in any pass.
 
-### 4. UTF-8 safety — PASS
-Re-detokenizing the whole token buffer via `encoding_rs` (as `detokenize` already
-does) yields valid UTF-8; releasing only on `char_indices` boundaries prevents
-mid-codepoint cuts. Test mandate: a multibyte (e.g. emoji / accented) split.
+### Audit Results
 
-### 5. Razor + constitutional — PASS
-New `stream_sanitizer.rs` is a focused file (< 250). No network, no new forbidden
-dep (reuses `SecurityPipeline` + regex already present). `StreamItem::Text` is a
-minimal protocol addition consistent with B-24a.
+#### Security Pass
 
-### 6. Terminal semantics — PASS
-Flush-on-terminal sanitizes the tail; `End(Error)` for an unrecoverable sanitizer
-state; `Rejected` stays ingress-only (egress redacts rather than rejects). Consistent
-with B-24a's terminal.
+**Result**: PASS
+No auth logic, no credentials, no bypassed checks. `load()` is fail-closed (missing/invalid
+`model.onnx` → `InferenceError::ModelError`; not-loaded embedder still errors cleanly).
+Tokenizer resolution reuses the existing B-28 offline `from_file` path — no network surface
+exists in the dependency set (`candle-onnx`, `candle-core`, `tokenizers` with
+`default-features = false`, `http`/`hf-hub` off). Read boundary respected: reads
+`<model_dir>/<model_id>/{model.onnx,tokenizer.json}` only, writes nothing.
 
-## Verdict
+#### Ghost UI Pass
 
-**PASS.** Proceed to IMPLEMENT. Carry the three test mandates (multi-word PII across
-boundary; UTF-8 multibyte split; terminal-flush redaction) — a happy-path-only test
-suite is insufficient for an L3 redaction control.
+**Result**: PASS
+No UI. Every proposed API lands on real logic: `load` → `with_model` → eval pipeline;
+`TextBatch` → per-item eval → `EmbeddingBatch`. No placeholder returns remain on the
+embedding path under the `onnx` feature; non-`onnx` builds fail loud as today.
+
+#### Section 4 Razor Pass
+
+| Check              | Limit | Blueprint Proposes | Status |
+| ------------------ | ----- | ------------------ | ------ |
+| Max function lines | 40    | ≤40 (pipeline split into helpers: select/pool/normalize/estimate) | OK |
+| Max file lines     | 250   | embedder.rs ≤250 after test extraction; tensor_ops.rs ≤250; embedder_tests.rs ≤250 | OK |
+| Max nesting depth  | 3     | ≤3 (flat helper chain, `?` propagation) | OK |
+| Nested ternaries   | 0     | 0 | OK |
+
+**Result**: PASS — the split is mandatory, not optional: embedder.rs sits at 222 lines today
+and cannot absorb the additions in place.
+
+#### Dependency Pass
+
+| Package | Justification | <10 Lines Vanilla? | Verdict |
+| ------- | ------------- | ------------------ | ------- |
+| (none new) | `candle-core`/`candle-onnx`/`tokenizers` already declared, feature-gated | n/a | PASS |
+
+**Result**: PASS — zero new dependencies; forbidden list (`reqwest`, `hyper`, WebSocket,
+traversal crates) untouched.
+
+#### Orphan Pass
+
+| Proposed File | Entry Point Connection | Status |
+| ------------- | ---------------------- | ------ |
+| `engine/onnx/tensor_ops.rs` | `embedder.rs` + `classifier.rs` → `onnx/mod.rs` → `engine` → `lib.rs` | Connected |
+| `engine/onnx/embedder_tests.rs` | `#[cfg(test)] #[path]` include from `embedder.rs` (existing dispatch pattern) | Connected |
+| `tests/fixtures/models/onnx/tiny-embedder/*` | Referenced by `embedder_tests.rs` via `CARGO_MANIFEST_DIR` | Connected |
+| `scripts/gen_onnx_fixture.py` | Dev-only provenance/regeneration script (precedent: `scripts/download-models.sh`); never on build/test path | Connected (tooling) |
+
+**Result**: PASS
+
+#### Macro-Level Architecture Pass
+
+**Result**: PASS
+Change confined to `engine/onnx/`; module boundaries and layering unchanged. Shared tensor
+helpers get a single source of truth (`tensor_ops.rs`) instead of classifier reaching into
+embedder internals — duplication decreases. `InferenceOutput::EmbeddingBatch` is additive;
+the only in-repo `match` on `InferenceOutput` (`engine/inference.rs:206`) carries a wildcard
+arm. Deterministic output selection mirrors the classifier's existing `logits` rule —
+consistent idiom, no new pattern.
+
+### Violations Found
+
+| ID  | Category | Location | Description |
+| --- | -------- | -------- | ----------- |
+| —   | none     | —        | —           |
+
+### Required Remediation
+
+None. Gate is OPEN.
+
+### Verdict Hash
+
+SHA256(this_report) = recorded in META_LEDGER Entry #203 (Content Hash)
+
+---
+
+_This verdict is binding. Implementation may proceed without modification._

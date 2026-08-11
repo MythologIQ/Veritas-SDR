@@ -1,7 +1,11 @@
 //! ONNX-based embedding model.
 //!
-//! Wraps Candle ONNX runtime for generating text embeddings.
+//! Wraps the Candle ONNX runtime for generating text embeddings: tokenize →
+//! `simple_eval` → deterministic hidden-state selection → attention-masked
+//! mean pooling → L2 normalization. Target model shape is MiniLM-style
+//! (`all-MiniLM-L6-v2`, 384 dims) but nothing model-specific is hardcoded.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::engine::{
@@ -12,7 +16,6 @@ use crate::engine::{
 /// ONNX embedding model using Candle.
 pub struct OnnxEmbedder {
     model_id: String,
-    #[allow(dead_code)]
     embedding_dim: usize,
     memory_bytes: AtomicUsize,
     #[cfg(feature = "onnx")]
@@ -22,7 +25,8 @@ pub struct OnnxEmbedder {
 }
 
 impl OnnxEmbedder {
-    /// Create a new embedder stub (no model loaded).
+    /// Create a new embedder in the not-loaded state — inference fails loud
+    /// until a model is attached via [`OnnxEmbedder::load`].
     pub fn new(model_id: String, embedding_dim: usize) -> Self {
         Self {
             model_id,
@@ -35,6 +39,42 @@ impl OnnxEmbedder {
         }
     }
 
+    /// Load an embedder from `<model_dir>/<model_id>/model.onnx` with its
+    /// sibling `tokenizer.json` (offline, read-only — no network path exists).
+    ///
+    /// # Errors
+    /// Fails loud when `model.onnx` is missing or not a valid ONNX model. A
+    /// missing `tokenizer.json` degrades to the logged hash fallback (B-28).
+    #[cfg(feature = "onnx")]
+    pub fn load(
+        model_dir: &Path,
+        model_id: &str,
+        embedding_dim: usize,
+    ) -> Result<Self, InferenceError> {
+        let model_path = model_dir.join(model_id).join("model.onnx");
+        let model = candle_onnx::read_file(&model_path)
+            .map_err(|e| InferenceError::ModelError(format!("load {model_path:?}: {e}")))?;
+        let tokenizer = super::tokenizer::OnnxTokenizer::for_model(&model_path);
+        Ok(Self::with_model(
+            model_id.to_string(),
+            embedding_dim,
+            model,
+            tokenizer,
+        ))
+    }
+
+    /// Stub for non-onnx builds: always fails loud so callers compile either way.
+    #[cfg(not(feature = "onnx"))]
+    pub fn load(
+        _model_dir: &Path,
+        _model_id: &str,
+        _embedding_dim: usize,
+    ) -> Result<Self, InferenceError> {
+        Err(InferenceError::ModelError(
+            "onnx feature not enabled".into(),
+        ))
+    }
+
     /// Create an embedder with a loaded Candle ONNX model and its tokenizer.
     #[cfg(feature = "onnx")]
     pub(super) fn with_model(
@@ -43,13 +83,19 @@ impl OnnxEmbedder {
         model: candle_onnx::onnx::ModelProto,
         tokenizer: super::tokenizer::OnnxTokenizer,
     ) -> Self {
+        let estimate = super::tensor_ops::model_memory_estimate(&model);
         Self {
             model_id,
             embedding_dim,
-            memory_bytes: AtomicUsize::new(0),
+            memory_bytes: AtomicUsize::new(estimate),
             model: Some(model),
             tokenizer,
         }
+    }
+
+    /// Expected embedding dimensionality of the wrapped model.
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
     }
 
     /// Generate embedding for a single text input.
@@ -67,65 +113,40 @@ impl OnnxEmbedder {
         }
     }
 
-    /// Run ONNX inference to produce an embedding vector.
+    /// Run ONNX inference to produce a unit-length embedding vector.
     #[cfg(feature = "onnx")]
     fn embed_text_onnx(&self, text: &str) -> Result<EmbeddingResult, InferenceError> {
+        use super::tensor_ops;
+
         let model = self.model.as_ref().ok_or_else(|| {
             InferenceError::ModelError(format!("model '{}' not loaded", self.model_id))
         })?;
 
-        let device = candle_core::Device::Cpu;
         let tokens = self.tokenizer.encode(text);
-        let inputs = build_transformer_inputs(&tokens, &device)?;
+        if tokens.is_empty() {
+            return Err(InferenceError::InputValidation(
+                "input tokenized to zero tokens".into(),
+            ));
+        }
+
+        let device = candle_core::Device::Cpu;
+        let inputs = tensor_ops::build_transformer_inputs(&tokens, &device)?;
+        let attention_mask = inputs["attention_mask"].clone();
 
         let outputs = candle_onnx::simple_eval(model, inputs)
             .map_err(|e| InferenceError::ModelError(format!("eval: {e}")))?;
+        let hidden = tensor_ops::select_hidden_state(&outputs)?;
 
-        let tensor = outputs
-            .values()
-            .next()
-            .ok_or_else(|| InferenceError::ModelError("no output tensor".into()))?;
-
-        let pooled =
-            mean_pool(tensor).map_err(|e| InferenceError::ModelError(format!("pool: {e}")))?;
-
-        let vector: Vec<f32> = pooled
+        let pooled = tensor_ops::masked_mean_pool(hidden, &attention_mask)
+            .map_err(|e| InferenceError::ModelError(format!("pool: {e}")))?;
+        let raw: Vec<f32> = pooled
             .to_vec1()
             .map_err(|e| InferenceError::ModelError(format!("vec: {e}")))?;
 
+        let vector = tensor_ops::l2_normalize(raw);
         let dimensions = vector.len();
         Ok(EmbeddingResult { vector, dimensions })
     }
-}
-
-/// Build input_ids, attention_mask, token_type_ids tensors.
-#[cfg(feature = "onnx")]
-pub(super) fn build_transformer_inputs(
-    tokens: &[i64],
-    device: &candle_core::Device,
-) -> Result<std::collections::HashMap<String, candle_core::Tensor>, InferenceError> {
-    let ids = candle_core::Tensor::new(tokens, device)
-        .and_then(|t| t.unsqueeze(0))
-        .map_err(|e| InferenceError::ModelError(format!("input: {e}")))?;
-
-    let attn = candle_core::Tensor::ones_like(&ids)
-        .map_err(|e| InferenceError::ModelError(format!("attn: {e}")))?;
-
-    let ttype = candle_core::Tensor::zeros_like(&ids)
-        .map_err(|e| InferenceError::ModelError(format!("ttype: {e}")))?;
-
-    let mut map = std::collections::HashMap::new();
-    map.insert("input_ids".to_string(), ids);
-    map.insert("attention_mask".to_string(), attn);
-    map.insert("token_type_ids".to_string(), ttype);
-    Ok(map)
-}
-
-/// Mean-pool across sequence dimension (dim 1) and squeeze batch.
-#[cfg(feature = "onnx")]
-fn mean_pool(tensor: &candle_core::Tensor) -> candle_core::Result<candle_core::Tensor> {
-    // tensor shape: [1, seq_len, hidden_dim] -> [hidden_dim]
-    tensor.mean(1)?.squeeze(0)
 }
 
 #[async_trait::async_trait]
@@ -154,11 +175,11 @@ impl crate::engine::Model for OnnxEmbedder {
                 Ok(InferenceOutput::Embedding(result))
             }
             InferenceInput::TextBatch(batch) => {
-                let text = batch.first().ok_or_else(|| {
-                    InferenceError::InputValidation("batch cannot be empty".into())
-                })?;
-                let result = self.embed_text(text)?;
-                Ok(InferenceOutput::Embedding(result))
+                let mut results = Vec::with_capacity(batch.len());
+                for text in batch {
+                    results.push(self.embed_text(text)?);
+                }
+                Ok(InferenceOutput::EmbeddingBatch(results))
             }
             InferenceInput::ChatMessages(_) => Err(InferenceError::CapabilityNotSupported(
                 "chat not supported for embedding".into(),
@@ -181,42 +202,5 @@ impl crate::engine::Model for OnnxEmbedder {
 }
 
 #[cfg(test)]
-#[cfg(feature = "onnx")]
-mod tests {
-    use super::*;
-
-    fn model_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/models/onnx/all-MiniLM-L6-v2.onnx")
-    }
-
-    #[test]
-    fn load_and_embed() {
-        // The ONNX fixture (~90 MB) is not committed; skip gracefully when
-        // absent (e.g. CI) — same convention as the gguf e2e tests.
-        let path = model_path();
-        if !path.exists() {
-            eprintln!(
-                "skipping load_and_embed: fixture {} not present",
-                path.display()
-            );
-            return;
-        }
-        let model = candle_onnx::read_file(&path).expect("load model");
-        let embedder = OnnxEmbedder::with_model(
-            "test".into(),
-            384,
-            model,
-            super::super::tokenizer::OnnxTokenizer::for_model(&path),
-        );
-        let result = embedder.embed_text("file.write").expect("embed");
-        assert_eq!(result.vector.len(), 384);
-        assert!(result.vector.iter().any(|&v| v != 0.0));
-    }
-
-    #[test]
-    fn missing_model_fails() {
-        let embedder = OnnxEmbedder::new("missing".into(), 384);
-        assert!(embedder.embed_text("test").is_err());
-    }
-}
+#[path = "embedder_tests.rs"]
+mod tests;

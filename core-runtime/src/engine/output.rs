@@ -8,6 +8,8 @@ pub enum InferenceOutput {
     Classification(ClassificationResult),
     Generation(GenerationResult),
     Embedding(EmbeddingResult),
+    /// One embedding per input of a `TextBatch`, in input order.
+    EmbeddingBatch(Vec<EmbeddingResult>),
     Entities(Vec<EntityResult>),
 }
 
@@ -86,5 +88,10 @@ impl InferenceOutput {
     /// Returns true if this is an embedding result.
     pub fn is_embedding(&self) -> bool {
         matches!(self, Self::Embedding(_))
+    }
+
+    /// Returns true if this is a batch-embedding result.
+    pub fn is_embedding_batch(&self) -> bool {
+        matches!(self, Self::EmbeddingBatch(_))
     }
 }

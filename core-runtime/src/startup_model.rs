@@ -124,13 +124,7 @@ mod tests {
 
     #[test]
     fn rejects_model_id_without_model_path() {
-        let error = parse(&args(&[
-            "gg-core-cli",
-            "serve",
-            "--model-id",
-            "orphan",
-        ]))
-        .unwrap_err();
+        let error = parse(&args(&["gg-core-cli", "serve", "--model-id", "orphan"])).unwrap_err();
         assert!(error.contains("requires --model"));
     }
 

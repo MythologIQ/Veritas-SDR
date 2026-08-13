@@ -147,4 +147,17 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("Only one startup --model"));
     }
+
+    #[tokio::test]
+    async fn preload_rejects_path_outside_contained_model_directories() {
+        let runtime = Runtime::new(Default::default());
+        let spec = StartupModelSpec {
+            path: "../escape.gguf".into(),
+            model_id: Some("escape".into()),
+        };
+
+        let error = preload(&runtime, &spec).await.unwrap_err().to_string();
+        assert!(error.contains("Model path not allowed"));
+        assert_eq!(runtime.model_lifecycle.count().await, 0);
+    }
 }
